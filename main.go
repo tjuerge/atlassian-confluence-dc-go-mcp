@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,8 @@ type ConfluenceConfig struct {
 const (
 	// defaultLimit is the default number of results for paginated requests.
 	defaultLimit = 25
+	// maxRetries is the maximum number of retries for rate-limited requests.
+	maxRetries = 3
 )
 
 // loadConfig loads configuration from environment variables.
@@ -81,6 +84,9 @@ func NewConfluenceClient(config *ConfluenceConfig) *ConfluenceClient {
 		config: config,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+			},
 		},
 	}
 }
@@ -126,47 +132,100 @@ func (c *ConfluenceClient) executeRequest(ctx context.Context, method, path stri
 }
 
 // doRequest performs an authenticated HTTP request and returns the body as bytes.
-// It handles basic error checking and limits the response size.
+// It handles basic error checking, limits the response size, and implements retry-after rate limit handling.
 func (c *ConfluenceClient) doRequest(ctx context.Context, method, path string, query url.Values, body any) ([]byte, error) {
-	resp, err := c.executeRequest(ctx, method, path, query, body)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		resp, err := c.executeRequest(ctx, method, path, query, body)
+		if err != nil {
+			return nil, err
+		}
+
+		respBytes, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-	}()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
 
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		if handleRateLimit(attempt, resp) {
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("rate limited after %d retries", maxRetries)
+		}
+
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBytes))
+		}
+
+		return respBytes, nil
 	}
 
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBytes))
-	}
-
-	return respBytes, nil
+	return nil, fmt.Errorf("unexpected error: exhausted retries")
 }
 
 // getJSON is a helper to perform a GET request and unmarshal the result into a target object efficiently.
+// It implements retry-after rate limit handling.
 func (c *ConfluenceClient) getJSON(ctx context.Context, path string, query url.Values, target any) error {
-	resp, err := c.executeRequest(ctx, "GET", path, query, nil)
-	if err != nil {
-		return err
-	}
-	defer func() {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		resp, err := c.executeRequest(ctx, "GET", path, query, nil)
+		if err != nil {
+			return err
+		}
+
+		if handleRateLimit(attempt, resp) {
+			_ = resp.Body.Close()
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			_ = resp.Body.Close()
+			return fmt.Errorf("rate limited after %d retries", maxRetries)
+		}
+
+		if resp.StatusCode >= 400 {
+			respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			_ = resp.Body.Close()
+			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBytes))
+		}
+
+		err = json.NewDecoder(resp.Body).Decode(target)
 		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode >= 400 {
-		respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBytes))
+		if err != nil {
+			return fmt.Errorf("failed to decode JSON: %w", err)
+		}
+		return nil
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
-		return fmt.Errorf("failed to decode JSON: %w", err)
+	return fmt.Errorf("unexpected error: exhausted retries")
+}
+
+// parseRetryAfter extracts the retry-after header value from the response in seconds.
+func parseRetryAfter(resp *http.Response) int {
+	header := resp.Header.Get("retry-after")
+	if header == "" {
+		return 0
 	}
-	return nil
+	seconds, err := strconv.Atoi(strings.TrimSpace(header))
+	if err != nil {
+		return 0
+	}
+	return seconds
+}
+
+// handleRateLimit handles HTTP 429 responses by sleeping and returning whether to retry.
+func handleRateLimit(attempt int, resp *http.Response) bool {
+	if resp.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	if attempt < maxRetries {
+		retryAfter := parseRetryAfter(resp)
+		if retryAfter > 0 {
+			time.Sleep(time.Duration(retryAfter) * time.Second)
+		}
+		return true
+	}
+	return false
 }
 
 // SpaceRef represents a reference to a Confluence space in API responses/requests.

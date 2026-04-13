@@ -1040,3 +1040,175 @@ func TestRun(t *testing.T) {
 		}
 	})
 }
+
+// TestParseRetryAfter tests parsing the retry-after header.
+func TestParseRetryAfter(t *testing.T) {
+	tests := []struct {
+		name     string
+		header   string
+		expected int
+	}{
+		{"empty header", "", 0},
+		{"valid seconds", "5", 5},
+		{"with whitespace", "  10  ", 10},
+		{"invalid value", "invalid", 0},
+		{"zero seconds", "0", 0},
+		{"large value", "120", 120},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header: http.Header{},
+			}
+			if tt.header != "" {
+				resp.Header.Set("retry-after", tt.header)
+			}
+			got := parseRetryAfter(resp)
+			if got != tt.expected {
+				t.Errorf("parseRetryAfter() = %d, want %d", got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestRateLimitRetryAfter tests that doRequest retries on 429 with retry-after header.
+func TestRateLimitRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	attempt := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt < 2 {
+			w.Header().Set("retry-after", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"123"}`))
+	}))
+	defer server.Close()
+
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	resp, err := client.doRequest(ctx, "GET", "/", nil, nil)
+	if err != nil {
+		t.Fatalf("doRequest failed: %v", err)
+	}
+	if attempt != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempt)
+	}
+	if !strings.Contains(string(resp), "123") {
+		t.Errorf("expected response with id, got %s", string(resp))
+	}
+}
+
+// TestRateLimitExhausted tests that doRequest fails after max retries.
+func TestRateLimitExhausted(t *testing.T) {
+	ctx := context.Background()
+	attempt := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		w.Header().Set("retry-after", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("rate limited"))
+	}))
+	defer server.Close()
+
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	_, err := client.doRequest(ctx, "GET", "/", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "rate limited after") {
+		t.Errorf("expected rate limit error, got %v", err)
+	}
+	if attempt != maxRetries+1 {
+		t.Errorf("expected %d attempts, got %d", maxRetries+1, attempt)
+	}
+}
+
+// TestGetJSONRateLimitRetry tests that getJSON retries on 429.
+func TestGetJSONRateLimitRetry(t *testing.T) {
+	ctx := context.Background()
+	attempt := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt < 2 {
+			w.Header().Set("retry-after", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"123","title":"Test"}`))
+	}))
+	defer server.Close()
+
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	var target map[string]any
+	err := client.getJSON(ctx, "/", nil, &target)
+	if err != nil {
+		t.Fatalf("getJSON failed: %v", err)
+	}
+	if attempt != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempt)
+	}
+	if target["id"] != "123" {
+		t.Errorf("expected id 123, got %v", target["id"])
+	}
+}
+
+// TestGetJSONRateLimitExhausted tests that getJSON fails after max retries.
+func TestGetJSONRateLimitExhausted(t *testing.T) {
+	ctx := context.Background()
+	attempt := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		w.Header().Set("retry-after", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("rate limited"))
+	}))
+	defer server.Close()
+
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	var target map[string]any
+	err := client.getJSON(ctx, "/", nil, &target)
+	if err == nil || !strings.Contains(err.Error(), "rate limited after") {
+		t.Errorf("expected rate limit error, got %v", err)
+	}
+	if attempt != maxRetries+1 {
+		t.Errorf("expected %d attempts, got %d", maxRetries+1, attempt)
+	}
+}
+
+// TestRateLimitWithoutRetryAfter tests retry with missing retry-after header (defaults to 0).
+func TestRateLimitWithoutRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	attempt := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt < 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"123"}`))
+	}))
+	defer server.Close()
+
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	resp, err := client.doRequest(ctx, "GET", "/", nil, nil)
+	if err != nil {
+		t.Fatalf("doRequest failed: %v", err)
+	}
+	if attempt != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempt)
+	}
+	if !strings.Contains(string(resp), "123") {
+		t.Errorf("expected successful response, got %s", string(resp))
+	}
+}
